@@ -10,7 +10,7 @@ import { writeGoodnotes } from './goodnotes.js';
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const MODEL_URL = params.get('model') || 'model.enc';
-const PRESETS = { fast: { n: 8, chunkWords: 0 }, good: { n: 64, chunkWords: 0 }, best: { n: 64, chunkWords: 2 } };
+const PRESETS = { instant: { n: 1, chunkWords: 0 }, fast: { n: 8, chunkWords: 0 }, good: { n: 64, chunkWords: 0 }, best: { n: 64, chunkWords: 2 } };
 let gpu = null, synth = null, readers = null, template = null, proto = null, stopFlag = false, wakeLock = null;
 
 const fmtMB = b => (b / 1e6).toFixed(1) + ' MB';
@@ -114,8 +114,9 @@ $('go').addEventListener('click', async () => {
   const t0 = performance.now();
   const tick = setInterval(() => {
     const s = Math.round((performance.now() - t0) / 1000);
-    const speed = synth.lastRun ? ` · ${(synth.lastRun.ms / synth.lastRun.steps).toFixed(1)} ms je Schritt` : '';
-    $('status').textContent = `Schreibt… ${s} s${speed}`;
+    const speed = synth.lastRun ? ` · Modell ${(synth.lastRun.ms / synth.lastRun.steps).toFixed(1)} ms je Schritt` : '';
+    const rd = readers[0].lastRun ? ` · Leser ${(readers[0].lastRun.ms / 1000).toFixed(1)} s je ${readers[0].lastRun.n}` : '';
+    $('status').textContent = `Schreibt… ${s} s${speed}${rd}`;
   }, 500);
   try {
     const { pages, baselines } = await writeText(synth, readers, text, { n, chunkWords: preset.chunkWords, seed, shouldStop: () => stopFlag,
@@ -129,7 +130,9 @@ $('go').addEventListener('click', async () => {
     $('share').hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
     $('result').hidden = false;
     const secs = Math.round((performance.now() - t0) / 1000);
-    $('status').textContent = `Fertig: ${pages.length} Seite${pages.length > 1 ? 'n' : ''}, ${$('lines').children.length} Zeilen in ${secs} s.`;
+    const speed = synth.lastRun ? ` Modell ${(synth.lastRun.ms / synth.lastRun.steps).toFixed(1)} ms je Schritt` : '';
+    const rd = readers[0].lastRun ? `, Leser ${(readers[0].lastRun.ms / 1000).toFixed(1)} s je ${readers[0].lastRun.n}` : '';
+    $('status').textContent = `Fertig: ${pages.length} Seite${pages.length > 1 ? 'n' : ''}, ${$('lines').children.length} Zeilen in ${secs} s.${speed}${rd}.`;
     window.__lastResult = { pages: pages.length, lines: $('lines').children.length, bytes: bytes.length, secs };
   } catch (err) {
     $('status').textContent = err.message === 'abgebrochen' ? 'Abgebrochen.' : 'Fehler: ' + err.message;
