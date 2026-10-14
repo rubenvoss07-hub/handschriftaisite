@@ -1,0 +1,25 @@
+<!doctype html><meta charset="utf-8"><pre id="o"></pre>
+<script type="module">
+import { parsePlain } from '../js/bundle.js';
+import { initGPU, SynthGPU } from '../js/gpu.js';
+window.__log = [];
+const log = s => { window.__log.push(s); document.getElementById('o').textContent += s + '\n'; };
+try {
+  const bundle = parsePlain(new Uint8Array(await (await fetch('fixtures/plain.bin')).arrayBuffer()));
+  const gpu = await initGPU();
+  log('device ' + gpu.info);
+  gpu.device.pushErrorScope('validation');
+  const synth = new SynthGPU(gpu, bundle.generator);
+  log('weights uploaded');
+  let t0 = performance.now();
+  const inks = await synth.sampleN('ab', 1, { seed: 1, maxSteps: 4, block: 4 });
+  log(`4 steps n=1: ${Math.round(performance.now() - t0)} ms, rows ${inks[0].length / 3}, first ${Array.from(inks[0].slice(3, 9)).map(v => v.toFixed(3))}`);
+  const err = await gpu.device.popErrorScope();
+  log('validation: ' + (err ? err.message.slice(0, 600) : 'none'));
+  t0 = performance.now();
+  await synth.sampleN('ab', 8, { seed: 1, maxSteps: 32, block: 16 });
+  log(`32 steps n=8: ${Math.round(performance.now() - t0)} ms`);
+  log('errors: ' + gpu.errors.slice(0, 3).join(' | '));
+} catch (e) { log('ERROR ' + (e.stack || e)); }
+window.__done = { fails: 0 };
+</script>

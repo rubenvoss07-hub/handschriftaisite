@@ -1,0 +1,86 @@
+<!doctype html><meta charset="utf-8"><title>gpu test</title><pre id="o"></pre>
+<script type="module">
+import { parsePlain } from '../js/bundle.js';
+import { SynthCPU } from '../js/synth_cpu.js';
+import { ReaderCPU, greedy, ctcNll } from '../js/reader_cpu.js';
+import { initGPU, SynthGPU, ReaderGPU } from '../js/gpu.js';
+import { bestOfChunks } from '../js/pick.js';
+window.__log = [];
+let fails = 0;
+const log = s => { window.__log.push(s); document.getElementById('o').textContent += s + '\n'; };
+const check = (name, ok, extra = '') => { if (!ok) fails++; log(`${ok ? 'PASS' : 'FAIL'}  ${name} ${extra}`); };
+const maxDiff = (a, b) => { let m = 0; for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
+const maxDiff2 = (A, B) => Math.max(...A.map((a, i) => maxDiff(a, B[i])));
+try {
+  const fx = await (await fetch('fixtures/fixtures.json')).json();
+  const bundle = parsePlain(new Uint8Array(await (await fetch('fixtures/plain.bin')).arrayBuffer()));
+  const gpu = await initGPU();
+  window.__gpu = gpu;
+  check('WebGPU device', !!gpu, gpu ? gpu.info : 'none');
+  const synth = new SynthGPU(gpu, bundle.generator), cpu = new SynthCPU(bundle.generator);
+  const [sx, sy] = fx.stats;
+  const norm = rows => rows.map(r => [r[0] / sx, r[1] / sy, r[2]]);
+  // 1. teacher-forced replay against torch
+  let t0 = performance.now();
+  const steps = Math.min(fx.raw[0].length - 1, 160);
+  let rep = await synth.replay(fx.text, norm(fx.raw[0].slice(0, steps)));
+  log(`replay ${rep.y.length} steps in ${Math.round(performance.now() - t0)} ms`);
+  let d = maxDiff2(rep.y, fx.replay.y.slice(0, steps));
+  check('GPU replay: head outputs match torch', d < 3e-3, `max diff ${d.toExponential(2)}`);
+  d = maxDiff2(rep.phi, fx.replay.phi.slice(0, steps));
+  check('GPU replay: phi matches torch', d < 3e-3, `max diff ${d.toExponential(2)}`);
+  const pink = norm(fx.prime_ink), first = [...pink[pink.length - 1]]; first[2] = 1;
+  const psteps = 80;
+  rep = await synth.replay(fx.text, [first, ...norm(fx.raw_primed.slice(1, psteps))], { primeText: fx.prime_text, primeRows: pink.slice(0, -1) });
+  d = maxDiff2(rep.y, fx.replay_primed.y.slice(0, rep.y.length));
+  check('GPU primed replay: head outputs match torch', d < 3e-3, `max diff ${d.toExponential(2)} over ${rep.y.length} steps`);
+  // 2. sampling: the GPU and CPU engines draw the same random numbers, so the same seed gives the same line
+  t0 = performance.now();
+  const g = await synth.sampleN(fx.text, 4, { seed: 11, maxSteps: 240 });
+  log(`GPU sampleN n=4: ${g.map(i => i.length / 3).join(',')} rows, ${synth.lastRun.steps} steps in ${Math.round(synth.lastRun.ms)} ms (${(synth.lastRun.ms / synth.lastRun.steps).toFixed(1)} ms/step)`);
+  const c = await cpu.sampleN(fx.text, 4, { seed: 11, maxSteps: 240 });
+  log(`CPU sampleN n=4: ${c.map(i => i.length / 3).join(',')} rows in ${Math.round(cpu.lastRun.ms)} ms`);
+  // f32 on the GPU against f64 on the CPU: a draw that lands within 1e-5 of a decision boundary flips a row
+  // and the rest of that row then differs (the state is chaotic), so most rows, not all, must be identical
+  let identical = 0, agree = [];
+  for (let r = 0; r < 4; r++) {
+    let t = 1;
+    for (; t < Math.min(g[r].length, c[r].length) / 3; t++) { if (Math.abs(g[r][3 * t] - c[r][3 * t]) > 2e-3 || Math.abs(g[r][3 * t + 1] - c[r][3 * t + 1]) > 2e-3 || g[r][3 * t + 2] !== c[r][3 * t + 2]) break; }
+    const same = g[r].length === c[r].length && t === g[r].length / 3;
+    if (same) identical++; else agree.push(t);
+    log(`  sample ${r}: ${same ? 'identical' : 'agrees for ' + t + ' steps, then a flipped draw'} (${g[r].length / 3} vs ${c[r].length / 3} rows)`);
+  }
+  check('GPU vs CPU sampling: at least 3 of 4 rows identical over 240 steps', identical >= 3 && agree.every(t => t >= 20), `${identical} identical`);
+  check('GPU sample ends pen-up', g.every(i => i[2] === 1 && i[i.length - 1] === 1));
+  const gl = await synth.sampleN('ab', 2, { seed: 3 });
+  check('GPU sampleN stops on its own for a short text', gl.every(i => i.length / 3 < 180), `${gl.map(i => i.length / 3)} rows (limit ${40 * 2 + 100})`);
+  // 3. the readers, batched with different lengths
+  const inks = fx.inks.map(i => Float32Array.from(i.flat()));
+  for (const [ri, rfx] of fx.readers.entries()) {
+    const rd = new ReaderGPU(gpu, bundle.readers[ri]);
+    t0 = performance.now();
+    const outs = await rd.logProbsBatch(inks);
+    log(`GPU reader ${ri}: ${Math.round(performance.now() - t0)} ms for 2 inks`);
+    for (const [i, { lp, T }] of outs.entries()) {
+      const want = rfx.logp[i].flat();
+      check(`GPU reader ${ri} ink ${i}: frames`, T === rfx.frames[i], `${T} vs ${rfx.frames[i]}`);
+      d = maxDiff(lp, want);
+      check(`GPU reader ${ri} ink ${i}: log-probs match torch`, d < 3e-3, `max diff ${d.toExponential(2)}`);
+      check(`GPU reader ${ri} ink ${i}: reads`, greedy(lp, T) === rfx.reads[i], JSON.stringify(greedy(lp, T)));
+      check(`GPU reader ${ri} ink ${i}: CTC nll`, Math.abs(ctcNll(lp, T, fx.text) - rfx.nll[i]) < 3e-3, `${ctcNll(lp, T, fx.text).toFixed(4)} vs ${rfx.nll[i].toFixed(4)}`);
+    }
+  }
+  // 4. a timing run at the page's size, and best-of-chunks end to end on the GPU
+  t0 = performance.now();
+  await synth.sampleN('Die Photosynthese findet in den Chloroplasten statt.', 64, { seed: 1, maxSteps: 24 });
+  log(`GPU sampleN n=64: ${synth.lastRun.steps} steps in ${Math.round(synth.lastRun.ms)} ms (${(synth.lastRun.ms / synth.lastRun.steps).toFixed(1)} ms/step; software GPU here)`);
+  const readers = bundle.readers.map(r => new ReaderGPU(gpu, r));
+  t0 = performance.now();
+  const best = await bestOfChunks(synth, readers, 'Das ist.', 2, { seed: 1, words: 1 });
+  log(`bestOfChunks n=8 on GPU: read ${JSON.stringify(best.ranked[0].read)}, ${best.ink.length / 3} rows, ${Math.round(performance.now() - t0)} ms`);
+  check('bestOfChunks on GPU reads most of the text', best.ranked[0].cer < 0.5, `cer ${best.ranked[0].cer.toFixed(2)}`);
+} catch (e) { fails++; log('ERROR ' + (e.stack || e)); }
+if (window.__gpu && window.__gpu.errors.length) log('GPU errors: ' + window.__gpu.errors.slice(0, 5).join(' | '));
+log(fails ? `${fails} FAILED` : 'ALL OK');
+window.__done = { fails };
+</script>
